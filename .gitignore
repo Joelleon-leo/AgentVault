@@ -36,6 +36,9 @@ yarn-error.log*
 # vercel
 .vercel
 
+# local data store (contains OAuth tokens)
+/.data
+
 # typescript
 *.tsbuildinfo
 next-env.d.ts
