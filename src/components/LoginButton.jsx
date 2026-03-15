@@ -3,7 +3,7 @@
 export default function LoginButton() {
   return (
     <a
-      href="/auth/login"
+      href="/api/auth/login"
       className="button login"
     >
       Log In
