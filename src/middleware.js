@@ -2,18 +2,23 @@ import { auth0 } from "./lib/auth0";
 import { NextResponse } from "next/server";
 
 export async function middleware(request) {
-  const response = await auth0.middleware(request);
+  try {
+    const response = await auth0.middleware(request);
 
-  // Add security headers to all responses
-  if (response) {
-    response.headers.set("X-Content-Type-Options", "nosniff");
-    response.headers.set("X-Frame-Options", "DENY");
-    response.headers.set("Referrer-Policy", "strict-origin-when-cross-origin");
-    response.headers.set("Permissions-Policy", "camera=(), microphone=(), geolocation=()");
-    response.headers.set("X-XSS-Protection", "1; mode=block");
+    // Add security headers to all responses
+    if (response) {
+      response.headers.set("X-Content-Type-Options", "nosniff");
+      response.headers.set("X-Frame-Options", "DENY");
+      response.headers.set("Referrer-Policy", "strict-origin-when-cross-origin");
+      response.headers.set("Permissions-Policy", "camera=(), microphone=(), geolocation=()");
+      response.headers.set("X-XSS-Protection", "1; mode=block");
+    }
+
+    return response;
+  } catch (error) {
+    console.error("Middleware error:", error);
+    return NextResponse.next();
   }
-
-  return response;
 }
 
 export const config = {
