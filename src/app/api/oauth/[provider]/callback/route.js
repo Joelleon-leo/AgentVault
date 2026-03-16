@@ -7,6 +7,14 @@ import {
   addActivityEntry,
 } from "@/lib/store";
 
+function normalizeBaseUrl(value, request) {
+  if (typeof value === "string" && value.trim()) {
+    return value.trim().replace(/\/+$/, "");
+  }
+  const origin = new URL(request.url).origin;
+  return origin.replace(/\/+$/, "");
+}
+
 // GET /api/oauth/[provider]/callback — handles OAuth callback
 export async function GET(request, { params }) {
   const { provider: serviceId } = await params;
@@ -15,7 +23,10 @@ export async function GET(request, { params }) {
   const state = searchParams.get("state");
   const error = searchParams.get("error");
 
-  const baseUrl = process.env.AUTH0_BASE_URL || "http://localhost:3000";
+  const baseUrl = normalizeBaseUrl(
+    process.env.OAUTH_BASE_URL || process.env.APP_BASE_URL || process.env.AUTH0_BASE_URL,
+    request
+  );
 
   // Handle OAuth errors
   if (error) {

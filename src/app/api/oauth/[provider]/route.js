@@ -4,6 +4,14 @@ import { getOAuthProvider, isOAuthConfigured } from "@/lib/oauth-config";
 import { storeOAuthState } from "@/lib/store";
 import crypto from "crypto";
 
+function normalizeBaseUrl(value, request) {
+  if (typeof value === "string" && value.trim()) {
+    return value.trim().replace(/\/+$/, "");
+  }
+  const origin = new URL(request.url).origin;
+  return origin.replace(/\/+$/, "");
+}
+
 // GET /api/oauth/[provider] — initiates OAuth flow
 export async function GET(request, { params }) {
   const session = await auth0.getSession();
@@ -37,7 +45,10 @@ export async function GET(request, { params }) {
   });
 
   const clientId = process.env[provider.clientIdEnv];
-  const baseUrl = process.env.AUTH0_BASE_URL || "http://localhost:3000";
+  const baseUrl = normalizeBaseUrl(
+    process.env.OAUTH_BASE_URL || process.env.APP_BASE_URL || process.env.AUTH0_BASE_URL,
+    request
+  );
   const redirectUri = `${baseUrl}/api/oauth/${serviceId}/callback`;
 
   const oauthScopes = provider.getOAuthScopes(scopes.split(",").filter(Boolean));
