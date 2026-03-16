@@ -1,16 +1,16 @@
 // Persistent data store for AgentVault
-// Uses a JSON file on disk so data survives server restarts and HMR reloads.
-// OAuth state tokens are kept in-memory only (short-lived CSRF tokens).
-// In production, replace with a real database (PostgreSQL, MongoDB, etc.).
+// Uses Neon (PostgreSQL) when DATABASE_URL is set.
+// Falls back to local JSON file for local/demo resilience.
 
 import fs from "fs";
 import path from "path";
 import { getOAuthProvider } from "./oauth-config";
+import { ensureTables, getSQL } from "./db";
 
 const DATA_DIR = path.join(process.cwd(), ".data");
 const DATA_FILE = path.join(DATA_DIR, "store.json");
 
-// ---- Persistence helpers ----
+const useDatabase = !!process.env.DATABASE_URL;
 
 function loadFromDisk() {
   try {
@@ -37,6 +37,7 @@ function saveToDisk() {
     if (!fs.existsSync(DATA_DIR)) {
       fs.mkdirSync(DATA_DIR, { recursive: true });
     }
+
     const data = {
       connections: Object.fromEntries(store.connections),
       tokens: Object.fromEntries(store.tokens),
@@ -45,13 +46,12 @@ function saveToDisk() {
       activityLog: store.activityLog,
       pendingRequests: Object.fromEntries(store.pendingRequests),
     };
+
     fs.writeFileSync(DATA_FILE, JSON.stringify(data, null, 2), "utf-8");
   } catch (err) {
     console.error("Failed to save store to disk:", err.message);
   }
 }
-
-// ---- Initialize store (survives HMR via globalThis) ----
 
 function initStore() {
   if (globalThis.__agentVaultStore) {
@@ -59,7 +59,6 @@ function initStore() {
   }
 
   const diskData = loadFromDisk();
-
   const s = diskData || {
     connections: new Map(),
     tokens: new Map(),
@@ -69,16 +68,52 @@ function initStore() {
     pendingRequests: new Map(),
   };
 
-  // OAuth states are always in-memory (short-lived CSRF tokens)
   s.oauthStates = new Map();
-
   globalThis.__agentVaultStore = s;
   return s;
 }
 
 const store = initStore();
 
-// --- Connected Services ---
+async function withDb(dbOperation, fallbackOperation) {
+  if (!useDatabase) {
+    return fallbackOperation();
+  }
+
+  try {
+    await ensureTables();
+    const sql = getSQL();
+    return await dbOperation(sql);
+  } catch (err) {
+    console.error("Database operation failed, falling back to local store:", err.message);
+    return fallbackOperation();
+  }
+}
+
+function normalizeConnectionRow(row) {
+  return {
+    serviceId: row.service_id,
+    serviceName: row.service_name,
+    grantedScopes: Array.isArray(row.granted_scopes) ? row.granted_scopes : [],
+    connectedAt: row.connected_at instanceof Date ? row.connected_at.toISOString() : String(row.connected_at),
+    status: row.status,
+    tokenVaultId: row.token_vault_id,
+  };
+}
+
+function normalizeActivityRow(row) {
+  return {
+    id: row.id,
+    userId: row.user_id,
+    timestamp: row.timestamp instanceof Date ? row.timestamp.toISOString() : String(row.timestamp),
+    type: row.type,
+    action: row.action,
+    service: row.service,
+    serviceId: row.service_id,
+    detail: row.detail,
+    status: row.status || "success",
+  };
+}
 
 const AVAILABLE_SERVICES = [
   {
@@ -141,146 +176,272 @@ export function getAvailableServices() {
   return AVAILABLE_SERVICES;
 }
 
-export function getUserConnections(userId) {
-  return store.connections.get(userId) || [];
+export async function getUserConnections(userId) {
+  return withDb(
+    async (sql) => {
+      const rows = await sql`
+        SELECT service_id, service_name, granted_scopes, connected_at, status, token_vault_id
+        FROM connections
+        WHERE user_id = ${userId}
+        ORDER BY connected_at DESC
+      `;
+      return rows.map(normalizeConnectionRow);
+    },
+    () => store.connections.get(userId) || []
+  );
 }
 
-export function connectService(userId, serviceId, grantedScopes) {
-  const connections = store.connections.get(userId) || [];
+export async function connectService(userId, serviceId, grantedScopes) {
   const service = AVAILABLE_SERVICES.find((s) => s.id === serviceId);
   if (!service) return null;
 
-  const existing = connections.find((c) => c.serviceId === serviceId);
-  if (existing) {
-    existing.grantedScopes = grantedScopes;
-    existing.connectedAt = new Date().toISOString();
-    existing.status = "active";
-  } else {
-    connections.push({
-      serviceId,
-      serviceName: service.name,
-      grantedScopes,
-      connectedAt: new Date().toISOString(),
-      status: "active",
-      tokenVaultId: `tv_${serviceId}_${Date.now()}`,
-    });
-  }
+  return withDb(
+    async (sql) => {
+      const tokenVaultId = `tv_${serviceId}_${Date.now()}`;
+      await sql`
+        INSERT INTO connections (user_id, service_id, service_name, granted_scopes, connected_at, status, token_vault_id)
+        VALUES (${userId}, ${serviceId}, ${service.name}, ${JSON.stringify(grantedScopes)}::jsonb, NOW(), 'active', ${tokenVaultId})
+        ON CONFLICT (user_id, service_id)
+        DO UPDATE SET
+          service_name = EXCLUDED.service_name,
+          granted_scopes = EXCLUDED.granted_scopes,
+          connected_at = NOW(),
+          status = 'active'
+      `;
 
-  store.connections.set(userId, connections);
-  addActivityEntry(userId, {
-    type: "connection",
-    action: existing ? "reconnected" : "connected",
-    service: service.name,
-    serviceId,
-    detail: `${service.name} connected with scopes: ${grantedScopes.join(", ")}`,
-  });
+      await addActivityEntry(userId, {
+        type: "connection",
+        action: "connected",
+        service: service.name,
+        serviceId,
+        detail: `${service.name} connected with scopes: ${grantedScopes.join(", ")}`,
+      });
 
-  saveToDisk();
-  return connections;
+      return getUserConnections(userId);
+    },
+    () => {
+      const connections = store.connections.get(userId) || [];
+      const existing = connections.find((c) => c.serviceId === serviceId);
+
+      if (existing) {
+        existing.grantedScopes = grantedScopes;
+        existing.connectedAt = new Date().toISOString();
+        existing.status = "active";
+      } else {
+        connections.push({
+          serviceId,
+          serviceName: service.name,
+          grantedScopes,
+          connectedAt: new Date().toISOString(),
+          status: "active",
+          tokenVaultId: `tv_${serviceId}_${Date.now()}`,
+        });
+      }
+
+      store.connections.set(userId, connections);
+      addActivityEntry(userId, {
+        type: "connection",
+        action: existing ? "reconnected" : "connected",
+        service: service.name,
+        serviceId,
+        detail: `${service.name} connected with scopes: ${grantedScopes.join(", ")}`,
+      });
+
+      saveToDisk();
+      return connections;
+    }
+  );
 }
 
-export function disconnectService(userId, serviceId) {
-  const connections = store.connections.get(userId) || [];
+export async function disconnectService(userId, serviceId) {
   const service = AVAILABLE_SERVICES.find((s) => s.id === serviceId);
-  const updated = connections.filter((c) => c.serviceId !== serviceId);
-  store.connections.set(userId, updated);
 
-  if (service) {
-    addActivityEntry(userId, {
-      type: "connection",
-      action: "disconnected",
-      service: service.name,
-      serviceId,
-      detail: `${service.name} disconnected and tokens revoked from vault`,
-    });
-  }
+  return withDb(
+    async (sql) => {
+      await sql`
+        DELETE FROM connections
+        WHERE user_id = ${userId} AND service_id = ${serviceId}
+      `;
 
-  saveToDisk();
-  return updated;
+      if (service) {
+        await addActivityEntry(userId, {
+          type: "connection",
+          action: "disconnected",
+          service: service.name,
+          serviceId,
+          detail: `${service.name} disconnected and tokens revoked from vault`,
+        });
+      }
+
+      return getUserConnections(userId);
+    },
+    () => {
+      const connections = store.connections.get(userId) || [];
+      const updated = connections.filter((c) => c.serviceId !== serviceId);
+      store.connections.set(userId, updated);
+
+      if (service) {
+        addActivityEntry(userId, {
+          type: "connection",
+          action: "disconnected",
+          service: service.name,
+          serviceId,
+          detail: `${service.name} disconnected and tokens revoked from vault`,
+        });
+      }
+
+      saveToDisk();
+      return updated;
+    }
+  );
 }
 
-// --- Agent Permissions ---
-
-export function getAgentPermissions(userId) {
-  return store.permissions.get(userId) || {
-    enabled: true,
-    requireApproval: true,
-    maxActionsPerHour: 10,
-    allowedServices: [],
-    blockedActions: [],
-  };
-}
-
-export function updateAgentPermissions(userId, permissions) {
-  const current = getAgentPermissions(userId);
-  const updated = { ...current, ...permissions };
-  store.permissions.set(userId, updated);
-
-  addActivityEntry(userId, {
-    type: "permission",
-    action: "updated",
-    service: "AgentVault",
-    serviceId: "agentvault",
-    detail: `Agent permissions updated`,
-  });
-
-  saveToDisk();
-  return updated;
-}
-
-// --- Firewall Policies ---
-
-const DEFAULT_AGENT_POLICIES = {
-  github: {
-    enabled: false,
-    allowedActions: [],
-  },
-  gmail: {
-    enabled: false,
-    allowedActions: [],
-  },
-  "google-drive": {
-    enabled: false,
-    allowedActions: [],
-  },
+const DEFAULT_PERMISSIONS = {
+  enabled: true,
+  requireApproval: true,
+  maxActionsPerHour: 10,
+  allowedServices: [],
+  blockedActions: [],
 };
 
-export function getAgentPolicies(userId) {
-  const stored = store.policies.get(userId);
-  return {
-    ...DEFAULT_AGENT_POLICIES,
-    ...(stored || {}),
-  };
+export async function getAgentPermissions(userId) {
+  return withDb(
+    async (sql) => {
+      const rows = await sql`
+        SELECT settings
+        FROM permissions
+        WHERE user_id = ${userId}
+        LIMIT 1
+      `;
+      if (!rows.length) return DEFAULT_PERMISSIONS;
+      return { ...DEFAULT_PERMISSIONS, ...(rows[0].settings || {}) };
+    },
+    () => store.permissions.get(userId) || DEFAULT_PERMISSIONS
+  );
 }
 
-export function updateAgentPolicies(userId, policyPatch) {
-  const current = getAgentPolicies(userId);
-  const merged = { ...current };
+export async function updateAgentPermissions(userId, permissions) {
+  return withDb(
+    async (sql) => {
+      const current = await getAgentPermissions(userId);
+      const updated = { ...current, ...permissions };
 
-  for (const [serviceId, patch] of Object.entries(policyPatch || {})) {
-    merged[serviceId] = {
-      ...(merged[serviceId] || { enabled: false, allowedActions: [] }),
-      ...(patch || {}),
-    };
-  }
+      await sql`
+        INSERT INTO permissions (user_id, settings)
+        VALUES (${userId}, ${JSON.stringify(updated)}::jsonb)
+        ON CONFLICT (user_id)
+        DO UPDATE SET settings = EXCLUDED.settings
+      `;
 
-  store.policies.set(userId, merged);
+      await addActivityEntry(userId, {
+        type: "permission",
+        action: "updated",
+        service: "AgentVault",
+        serviceId: "agentvault",
+        detail: "Agent permissions updated",
+      });
 
-  addActivityEntry(userId, {
-    type: "permission",
-    action: "firewall_policy_updated",
-    service: "AgentVault",
-    serviceId: "agentvault",
-    detail: "Firewall policies updated",
-  });
+      return updated;
+    },
+    () => {
+      const current = store.permissions.get(userId) || DEFAULT_PERMISSIONS;
+      const updated = { ...current, ...permissions };
+      store.permissions.set(userId, updated);
 
-  saveToDisk();
-  return merged;
+      addActivityEntry(userId, {
+        type: "permission",
+        action: "updated",
+        service: "AgentVault",
+        serviceId: "agentvault",
+        detail: "Agent permissions updated",
+      });
+
+      saveToDisk();
+      return updated;
+    }
+  );
 }
 
-// --- Activity Log ---
+const DEFAULT_AGENT_POLICIES = {
+  github: { enabled: false, allowedActions: [] },
+  gmail: { enabled: false, allowedActions: [] },
+  "google-drive": { enabled: false, allowedActions: [] },
+};
 
-export function addActivityEntry(userId, entry) {
+export async function getAgentPolicies(userId) {
+  return withDb(
+    async (sql) => {
+      const rows = await sql`
+        SELECT policies
+        FROM agent_policies
+        WHERE user_id = ${userId}
+        LIMIT 1
+      `;
+      const fromDb = rows.length ? rows[0].policies || {} : {};
+      return { ...DEFAULT_AGENT_POLICIES, ...fromDb };
+    },
+    () => ({ ...DEFAULT_AGENT_POLICIES, ...(store.policies.get(userId) || {}) })
+  );
+}
+
+export async function updateAgentPolicies(userId, policyPatch) {
+  return withDb(
+    async (sql) => {
+      const current = await getAgentPolicies(userId);
+      const merged = { ...current };
+
+      for (const [serviceId, patch] of Object.entries(policyPatch || {})) {
+        merged[serviceId] = {
+          ...(merged[serviceId] || { enabled: false, allowedActions: [] }),
+          ...(patch || {}),
+        };
+      }
+
+      await sql`
+        INSERT INTO agent_policies (user_id, policies)
+        VALUES (${userId}, ${JSON.stringify(merged)}::jsonb)
+        ON CONFLICT (user_id)
+        DO UPDATE SET policies = EXCLUDED.policies
+      `;
+
+      await addActivityEntry(userId, {
+        type: "permission",
+        action: "firewall_policy_updated",
+        service: "AgentVault",
+        serviceId: "agentvault",
+        detail: "Firewall policies updated",
+      });
+
+      return merged;
+    },
+    () => {
+      const current = { ...DEFAULT_AGENT_POLICIES, ...(store.policies.get(userId) || {}) };
+      const merged = { ...current };
+
+      for (const [serviceId, patch] of Object.entries(policyPatch || {})) {
+        merged[serviceId] = {
+          ...(merged[serviceId] || { enabled: false, allowedActions: [] }),
+          ...(patch || {}),
+        };
+      }
+
+      store.policies.set(userId, merged);
+
+      addActivityEntry(userId, {
+        type: "permission",
+        action: "firewall_policy_updated",
+        service: "AgentVault",
+        serviceId: "agentvault",
+        detail: "Firewall policies updated",
+      });
+
+      saveToDisk();
+      return merged;
+    }
+  );
+}
+
+export async function addActivityEntry(userId, entry) {
   const logEntry = {
     id: `log_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
     userId,
@@ -288,39 +449,90 @@ export function addActivityEntry(userId, entry) {
     status: entry.status || "success",
     ...entry,
   };
-  store.activityLog.unshift(logEntry);
 
-  // Keep only last 500 entries
-  if (store.activityLog.length > 500) {
-    store.activityLog = store.activityLog.slice(0, 500);
-  }
-
-  saveToDisk();
-  return logEntry;
+  return withDb(
+    async (sql) => {
+      await sql`
+        INSERT INTO activity_log (id, user_id, timestamp, type, action, service, service_id, detail, status)
+        VALUES (
+          ${logEntry.id},
+          ${userId},
+          ${logEntry.timestamp},
+          ${logEntry.type || null},
+          ${logEntry.action || null},
+          ${logEntry.service || null},
+          ${logEntry.serviceId || null},
+          ${logEntry.detail || null},
+          ${logEntry.status}
+        )
+      `;
+      return logEntry;
+    },
+    () => {
+      store.activityLog.unshift(logEntry);
+      if (store.activityLog.length > 500) {
+        store.activityLog = store.activityLog.slice(0, 500);
+      }
+      saveToDisk();
+      return logEntry;
+    }
+  );
 }
 
-export function getActivityLog(userId, limit = 50) {
-  return store.activityLog
-    .filter((entry) => entry.userId === userId)
-    .slice(0, limit);
+export async function getActivityLog(userId, limit = 50) {
+  return withDb(
+    async (sql) => {
+      const rows = await sql`
+        SELECT id, user_id, timestamp, type, action, service, service_id, detail, status
+        FROM activity_log
+        WHERE user_id = ${userId}
+        ORDER BY timestamp DESC
+        LIMIT ${limit}
+      `;
+      return rows.map(normalizeActivityRow);
+    },
+    () => store.activityLog.filter((entry) => entry.userId === userId).slice(0, limit)
+  );
 }
 
-export function getAllActivityLog(limit = 50) {
-  return store.activityLog.slice(0, limit);
+export async function getAllActivityLog(limit = 50) {
+  return withDb(
+    async (sql) => {
+      const rows = await sql`
+        SELECT id, user_id, timestamp, type, action, service, service_id, detail, status
+        FROM activity_log
+        ORDER BY timestamp DESC
+        LIMIT ${limit}
+      `;
+      return rows.map(normalizeActivityRow);
+    },
+    () => store.activityLog.slice(0, limit)
+  );
 }
 
-export function getRecentActionCount(userId) {
-  const oneHourAgo = Date.now() - 60 * 60 * 1000;
-  return store.activityLog.filter((entry) => {
-    if (entry.userId !== userId) return false;
-    const ts = Date.parse(entry.timestamp);
-    return Number.isFinite(ts) && ts >= oneHourAgo;
-  }).length;
+export async function getRecentActionCount(userId) {
+  return withDb(
+    async (sql) => {
+      const rows = await sql`
+        SELECT COUNT(*)::int AS count
+        FROM activity_log
+        WHERE user_id = ${userId}
+          AND timestamp >= NOW() - INTERVAL '1 hour'
+      `;
+      return rows[0]?.count || 0;
+    },
+    () => {
+      const oneHourAgo = Date.now() - 60 * 60 * 1000;
+      return store.activityLog.filter((entry) => {
+        if (entry.userId !== userId) return false;
+        const ts = Date.parse(entry.timestamp);
+        return Number.isFinite(ts) && ts >= oneHourAgo;
+      }).length;
+    }
+  );
 }
 
-// --- Pending Requests ---
-
-export function createPendingRequest(userId, request) {
+export async function createPendingRequest(userId, request) {
   const id = `req_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
   const pending = {
     id,
@@ -330,81 +542,211 @@ export function createPendingRequest(userId, request) {
     ...request,
   };
 
-  const userRequests = store.pendingRequests.get(userId) || [];
-  userRequests.push(pending);
-  store.pendingRequests.set(userId, userRequests);
-
-  saveToDisk();
-  return pending;
-}
-
-export function getPendingRequests(userId) {
-  return (store.pendingRequests.get(userId) || []).filter(
-    (r) => r.status === "pending"
+  return withDb(
+    async (sql) => {
+      await sql`
+        INSERT INTO pending_requests (id, user_id, created_at, status, data)
+        VALUES (${id}, ${userId}, ${pending.createdAt}, 'pending', ${JSON.stringify(request || {})}::jsonb)
+      `;
+      return pending;
+    },
+    () => {
+      const userRequests = store.pendingRequests.get(userId) || [];
+      userRequests.push(pending);
+      store.pendingRequests.set(userId, userRequests);
+      saveToDisk();
+      return pending;
+    }
   );
 }
 
-export function resolveRequest(userId, requestId, approved) {
-  const userRequests = store.pendingRequests.get(userId) || [];
-  const request = userRequests.find((r) => r.id === requestId);
-  if (!request) return null;
-
-  request.status = approved ? "approved" : "denied";
-  request.resolvedAt = new Date().toISOString();
-  saveToDisk();
-
-  addActivityEntry(userId, {
-    type: "agent_action",
-    action: approved ? "approved" : "denied",
-    service: request.service,
-    serviceId: request.serviceId,
-    detail: `Agent request to ${request.actionDescription} was ${approved ? "approved" : "denied"}`,
-    status: approved ? "success" : "blocked",
-  });
-
-  return request;
+export async function getPendingRequests(userId) {
+  return withDb(
+    async (sql) => {
+      const rows = await sql`
+        SELECT id, user_id, created_at, status, resolved_at, data
+        FROM pending_requests
+        WHERE user_id = ${userId} AND status = 'pending'
+        ORDER BY created_at DESC
+      `;
+      return rows.map((row) => ({
+        id: row.id,
+        userId: row.user_id,
+        createdAt: row.created_at instanceof Date ? row.created_at.toISOString() : String(row.created_at),
+        status: row.status,
+        resolvedAt: row.resolved_at ? (row.resolved_at instanceof Date ? row.resolved_at.toISOString() : String(row.resolved_at)) : null,
+        ...(row.data || {}),
+      }));
+    },
+    () => (store.pendingRequests.get(userId) || []).filter((r) => r.status === "pending")
+  );
 }
 
-// --- OAuth Token Storage ---
+export async function resolveRequest(userId, requestId, approved) {
+  return withDb(
+    async (sql) => {
+      const rows = await sql`
+        SELECT id, user_id, created_at, status, resolved_at, data
+        FROM pending_requests
+        WHERE user_id = ${userId} AND id = ${requestId}
+        LIMIT 1
+      `;
+      if (!rows.length) return null;
 
-export function storeOAuthToken(userId, serviceId, tokenData) {
-  const key = `${userId}:${serviceId}`;
-  store.tokens.set(key, {
+      const existing = rows[0];
+      await sql`
+        UPDATE pending_requests
+        SET status = ${approved ? "approved" : "denied"}, resolved_at = NOW()
+        WHERE id = ${requestId} AND user_id = ${userId}
+      `;
+
+      const request = {
+        id: existing.id,
+        userId: existing.user_id,
+        createdAt: existing.created_at instanceof Date ? existing.created_at.toISOString() : String(existing.created_at),
+        resolvedAt: new Date().toISOString(),
+        status: approved ? "approved" : "denied",
+        ...(existing.data || {}),
+      };
+
+      await addActivityEntry(userId, {
+        type: "agent_action",
+        action: approved ? "approved" : "denied",
+        service: request.service,
+        serviceId: request.serviceId,
+        detail: `Agent request to ${request.actionDescription} was ${approved ? "approved" : "denied"}`,
+        status: approved ? "success" : "blocked",
+      });
+
+      return request;
+    },
+    () => {
+      const userRequests = store.pendingRequests.get(userId) || [];
+      const request = userRequests.find((r) => r.id === requestId);
+      if (!request) return null;
+
+      request.status = approved ? "approved" : "denied";
+      request.resolvedAt = new Date().toISOString();
+      saveToDisk();
+
+      addActivityEntry(userId, {
+        type: "agent_action",
+        action: approved ? "approved" : "denied",
+        service: request.service,
+        serviceId: request.serviceId,
+        detail: `Agent request to ${request.actionDescription} was ${approved ? "approved" : "denied"}`,
+        status: approved ? "success" : "blocked",
+      });
+
+      return request;
+    }
+  );
+}
+
+export async function storeOAuthToken(userId, serviceId, tokenData) {
+  const payload = {
     accessToken: tokenData.access_token,
     refreshToken: tokenData.refresh_token || null,
     tokenType: tokenData.token_type || "Bearer",
-    expiresAt: tokenData.expires_in
-      ? Date.now() + tokenData.expires_in * 1000
-      : null,
+    expiresAt: tokenData.expires_in ? Date.now() + tokenData.expires_in * 1000 : null,
     scope: tokenData.scope || "",
     storedAt: Date.now(),
-  });
-  saveToDisk();
+  };
+
+  return withDb(
+    async (sql) => {
+      await sql`
+        INSERT INTO tokens (user_id, service_id, access_token, refresh_token, token_type, expires_at, scope, stored_at)
+        VALUES (
+          ${userId},
+          ${serviceId},
+          ${payload.accessToken},
+          ${payload.refreshToken},
+          ${payload.tokenType},
+          ${payload.expiresAt},
+          ${payload.scope},
+          ${payload.storedAt}
+        )
+        ON CONFLICT (user_id, service_id)
+        DO UPDATE SET
+          access_token = EXCLUDED.access_token,
+          refresh_token = EXCLUDED.refresh_token,
+          token_type = EXCLUDED.token_type,
+          expires_at = EXCLUDED.expires_at,
+          scope = EXCLUDED.scope,
+          stored_at = EXCLUDED.stored_at
+      `;
+      return payload;
+    },
+    () => {
+      const key = `${userId}:${serviceId}`;
+      store.tokens.set(key, payload);
+      saveToDisk();
+      return payload;
+    }
+  );
 }
 
-export function getOAuthToken(userId, serviceId) {
-  const key = `${userId}:${serviceId}`;
-  const token = store.tokens.get(key);
-  if (!token) return null;
-  // Check expiry (with 60s buffer)
-  if (token.expiresAt && Date.now() > token.expiresAt - 60000) {
-    return { ...token, expired: true };
-  }
-  return { ...token, expired: false };
+export async function getOAuthToken(userId, serviceId) {
+  return withDb(
+    async (sql) => {
+      const rows = await sql`
+        SELECT access_token, refresh_token, token_type, expires_at, scope, stored_at
+        FROM tokens
+        WHERE user_id = ${userId} AND service_id = ${serviceId}
+        LIMIT 1
+      `;
+      if (!rows.length) return null;
+      const token = rows[0];
+      const expiresAt = token.expires_at === null ? null : Number(token.expires_at);
+      const expired = !!(expiresAt && Date.now() > expiresAt - 60000);
+
+      return {
+        accessToken: token.access_token,
+        refreshToken: token.refresh_token,
+        tokenType: token.token_type || "Bearer",
+        expiresAt,
+        scope: token.scope || "",
+        storedAt: token.stored_at === null ? null : Number(token.stored_at),
+        expired,
+      };
+    },
+    () => {
+      const key = `${userId}:${serviceId}`;
+      const token = store.tokens.get(key);
+      if (!token) return null;
+      if (token.expiresAt && Date.now() > token.expiresAt - 60000) {
+        return { ...token, expired: true };
+      }
+      return { ...token, expired: false };
+    }
+  );
 }
 
-export function deleteOAuthToken(userId, serviceId) {
-  const key = `${userId}:${serviceId}`;
-  store.tokens.delete(key);
-  saveToDisk();
+export async function deleteOAuthToken(userId, serviceId) {
+  return withDb(
+    async (sql) => {
+      await sql`
+        DELETE FROM tokens
+        WHERE user_id = ${userId} AND service_id = ${serviceId}
+      `;
+      return true;
+    },
+    () => {
+      const key = `${userId}:${serviceId}`;
+      store.tokens.delete(key);
+      saveToDisk();
+      return true;
+    }
+  );
 }
 
-export function getAllTokenMetadata(userId) {
-  const connections = getUserConnections(userId);
+export async function getAllTokenMetadata(userId) {
+  const connections = await getUserConnections(userId);
   const metadata = {};
 
   for (const connection of connections) {
-    const token = getOAuthToken(userId, connection.serviceId);
+    const token = await getOAuthToken(userId, connection.serviceId);
     if (!token) continue;
 
     metadata[connection.serviceId] = {
@@ -421,7 +763,7 @@ export function getAllTokenMetadata(userId) {
 }
 
 export async function refreshOAuthToken(userId, serviceId) {
-  const current = getOAuthToken(userId, serviceId);
+  const current = await getOAuthToken(userId, serviceId);
   if (!current?.refreshToken) {
     return null;
   }
@@ -466,12 +808,12 @@ export async function refreshOAuthToken(userId, serviceId) {
       return null;
     }
 
-    storeOAuthToken(userId, serviceId, {
+    await storeOAuthToken(userId, serviceId, {
       ...refreshed,
       refresh_token: refreshed.refresh_token || current.refreshToken,
     });
 
-    addActivityEntry(userId, {
+    await addActivityEntry(userId, {
       type: "token_vault",
       action: "oauth_token_refreshed",
       service: serviceId,
@@ -487,12 +829,9 @@ export async function refreshOAuthToken(userId, serviceId) {
   }
 }
 
-// --- OAuth State (CSRF protection) ---
-
 export function storeOAuthState(state, data) {
-  // Auto-expire states after 10 minutes
   store.oauthStates.set(state, { ...data, createdAt: Date.now() });
-  // Cleanup old states
+
   const tenMinutes = 10 * 60 * 1000;
   for (const [key, val] of store.oauthStates) {
     if (Date.now() - val.createdAt > tenMinutes) {
@@ -505,7 +844,6 @@ export function consumeOAuthState(state) {
   const data = store.oauthStates.get(state);
   if (!data) return null;
   store.oauthStates.delete(state);
-  // Reject if older than 10 minutes
   if (Date.now() - data.createdAt > 10 * 60 * 1000) return null;
   return data;
 }
