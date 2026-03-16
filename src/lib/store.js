@@ -1,12 +1,78 @@
 // Persistent data store for AgentVault
-// Uses Neon PostgreSQL for persistence so data survives restarts, HMR, and navigation.
+// Uses a JSON file on disk so data survives server restarts and HMR reloads.
 // OAuth state tokens are kept in-memory only (short-lived CSRF tokens).
+// In production, replace with a real database (PostgreSQL, MongoDB, etc.).
 
-import { getSQL, ensureTables } from "./db";
+import fs from "fs";
+import path from "path";
 
-// OAuth states are always in-memory (short-lived CSRF tokens)
-const oauthStates = globalThis.__oauthStates || new Map();
-globalThis.__oauthStates = oauthStates;
+const DATA_DIR = path.join(process.cwd(), ".data");
+const DATA_FILE = path.join(DATA_DIR, "store.json");
+
+// ---- Persistence helpers ----
+
+function loadFromDisk() {
+  try {
+    if (fs.existsSync(DATA_FILE)) {
+      const raw = fs.readFileSync(DATA_FILE, "utf-8");
+      const data = JSON.parse(raw);
+      return {
+        connections: new Map(Object.entries(data.connections || {})),
+        tokens: new Map(Object.entries(data.tokens || {})),
+        permissions: new Map(Object.entries(data.permissions || {})),
+        activityLog: data.activityLog || [],
+        pendingRequests: new Map(Object.entries(data.pendingRequests || {})),
+      };
+    }
+  } catch (err) {
+    console.error("Failed to load store from disk, starting fresh:", err.message);
+  }
+  return null;
+}
+
+function saveToDisk() {
+  try {
+    if (!fs.existsSync(DATA_DIR)) {
+      fs.mkdirSync(DATA_DIR, { recursive: true });
+    }
+    const data = {
+      connections: Object.fromEntries(store.connections),
+      tokens: Object.fromEntries(store.tokens),
+      permissions: Object.fromEntries(store.permissions),
+      activityLog: store.activityLog,
+      pendingRequests: Object.fromEntries(store.pendingRequests),
+    };
+    fs.writeFileSync(DATA_FILE, JSON.stringify(data, null, 2), "utf-8");
+  } catch (err) {
+    console.error("Failed to save store to disk:", err.message);
+  }
+}
+
+// ---- Initialize store (survives HMR via globalThis) ----
+
+function initStore() {
+  if (globalThis.__agentVaultStore) {
+    return globalThis.__agentVaultStore;
+  }
+
+  const diskData = loadFromDisk();
+
+  const s = diskData || {
+    connections: new Map(),
+    tokens: new Map(),
+    permissions: new Map(),
+    activityLog: [],
+    pendingRequests: new Map(),
+  };
+
+  // OAuth states are always in-memory (short-lived CSRF tokens)
+  s.oauthStates = new Map();
+
+  globalThis.__agentVaultStore = s;
+  return s;
+}
+
+const store = initStore();
 
 // --- Connected Services ---
 
@@ -19,6 +85,15 @@ const AVAILABLE_SERVICES = [
     scopes: ["repo:read", "repo:write", "issues:read", "issues:write", "pr:read", "pr:write"],
     color: "#f0f6fc",
     bgColor: "#161b22",
+  },
+  {
+    id: "slack",
+    name: "Slack",
+    icon: "slack",
+    description: "Send messages, read channels, and manage notifications.",
+    scopes: ["channels:read", "messages:write", "messages:read", "files:write"],
+    color: "#e8d5f5",
+    bgColor: "#4a154b",
   },
   {
     id: "google-drive",
@@ -38,81 +113,76 @@ const AVAILABLE_SERVICES = [
     color: "#fce4ec",
     bgColor: "#b71c1c",
   },
+  {
+    id: "notion",
+    name: "Notion",
+    icon: "notion",
+    description: "Access pages, databases, and workspace content.",
+    scopes: ["pages:read", "pages:write", "databases:read", "databases:write"],
+    color: "#f5f5f5",
+    bgColor: "#191919",
+  },
+  {
+    id: "jira",
+    name: "Jira",
+    icon: "jira",
+    description: "Manage projects, issues, and sprints.",
+    scopes: ["issues:read", "issues:write", "projects:read", "sprints:manage"],
+    color: "#e3f2fd",
+    bgColor: "#0052cc",
+  },
 ];
 
 export function getAvailableServices() {
   return AVAILABLE_SERVICES;
 }
 
-// --- Connected Services (PostgreSQL) ---
-
-export async function getUserConnections(userId) {
-  await ensureTables();
-  const sql = getSQL();
-  const rows = await sql`
-    SELECT service_id, service_name, granted_scopes, connected_at, status, token_vault_id
-    FROM connections WHERE user_id = ${userId} AND status = 'active'
-  `;
-  return rows.map((r) => ({
-    serviceId: r.service_id,
-    serviceName: r.service_name,
-    grantedScopes: r.granted_scopes,
-    connectedAt: r.connected_at,
-    status: r.status,
-    tokenVaultId: r.token_vault_id,
-  }));
+export function getUserConnections(userId) {
+  return store.connections.get(userId) || [];
 }
 
-export async function connectService(userId, serviceId, grantedScopes) {
-  await ensureTables();
-  const sql = getSQL();
+export function connectService(userId, serviceId, grantedScopes) {
+  const connections = store.connections.get(userId) || [];
   const service = AVAILABLE_SERVICES.find((s) => s.id === serviceId);
   if (!service) return null;
 
-  const now = new Date().toISOString();
-  const tokenVaultId = `tv_${serviceId}_${Date.now()}`;
-
-  // Upsert: insert or update on conflict
-  const existing = await sql`
-    SELECT id FROM connections WHERE user_id = ${userId} AND service_id = ${serviceId}
-  `;
-
-  if (existing.length > 0) {
-    await sql`
-      UPDATE connections
-      SET granted_scopes = ${JSON.stringify(grantedScopes)},
-          connected_at = ${now},
-          status = 'active',
-          service_name = ${service.name}
-      WHERE user_id = ${userId} AND service_id = ${serviceId}
-    `;
+  const existing = connections.find((c) => c.serviceId === serviceId);
+  if (existing) {
+    existing.grantedScopes = grantedScopes;
+    existing.connectedAt = new Date().toISOString();
+    existing.status = "active";
   } else {
-    await sql`
-      INSERT INTO connections (user_id, service_id, service_name, granted_scopes, connected_at, status, token_vault_id)
-      VALUES (${userId}, ${serviceId}, ${service.name}, ${JSON.stringify(grantedScopes)}, ${now}, 'active', ${tokenVaultId})
-    `;
+    connections.push({
+      serviceId,
+      serviceName: service.name,
+      grantedScopes,
+      connectedAt: new Date().toISOString(),
+      status: "active",
+      tokenVaultId: `tv_${serviceId}_${Date.now()}`,
+    });
   }
 
-  await addActivityEntry(userId, {
+  store.connections.set(userId, connections);
+  addActivityEntry(userId, {
     type: "connection",
-    action: existing.length > 0 ? "reconnected" : "connected",
+    action: existing ? "reconnected" : "connected",
     service: service.name,
     serviceId,
     detail: `${service.name} connected with scopes: ${grantedScopes.join(", ")}`,
   });
 
-  return getUserConnections(userId);
+  saveToDisk();
+  return connections;
 }
 
-export async function disconnectService(userId, serviceId) {
-  await ensureTables();
-  const sql = getSQL();
+export function disconnectService(userId, serviceId) {
+  const connections = store.connections.get(userId) || [];
   const service = AVAILABLE_SERVICES.find((s) => s.id === serviceId);
-
-  await sql`DELETE FROM connections WHERE user_id = ${userId} AND service_id = ${serviceId}`;
+  const updated = connections.filter((c) => c.serviceId !== serviceId);
+  store.connections.set(userId, updated);
 
   if (service) {
-    await addActivityEntry(userId, {
+    addActivityEntry(userId, {
       type: "connection",
       action: "disconnected",
       service: service.name,
@@ -121,41 +191,28 @@ export async function disconnectService(userId, serviceId) {
     });
   }
 
-  return getUserConnections(userId);
+  saveToDisk();
+  return updated;
 }
 
-// --- Agent Permissions (PostgreSQL) ---
+// --- Agent Permissions ---
 
-const DEFAULT_PERMISSIONS = {
-  enabled: true,
-  requireApproval: true,
-  maxActionsPerHour: 10,
-  allowedServices: [],
-  blockedActions: [],
-};
-
-export async function getAgentPermissions(userId) {
-  await ensureTables();
-  const sql = getSQL();
-  const rows = await sql`SELECT settings FROM permissions WHERE user_id = ${userId}`;
-  if (rows.length === 0) return { ...DEFAULT_PERMISSIONS };
-  return { ...DEFAULT_PERMISSIONS, ...rows[0].settings };
+export function getAgentPermissions(userId) {
+  return store.permissions.get(userId) || {
+    enabled: true,
+    requireApproval: true,
+    maxActionsPerHour: 10,
+    allowedServices: [],
+    blockedActions: [],
+  };
 }
 
-export async function updateAgentPermissions(userId, permissions) {
-  await ensureTables();
-  const sql = getSQL();
-  const current = await getAgentPermissions(userId);
+export function updateAgentPermissions(userId, permissions) {
+  const current = getAgentPermissions(userId);
   const updated = { ...current, ...permissions };
+  store.permissions.set(userId, updated);
 
-  const existing = await sql`SELECT user_id FROM permissions WHERE user_id = ${userId}`;
-  if (existing.length > 0) {
-    await sql`UPDATE permissions SET settings = ${JSON.stringify(updated)} WHERE user_id = ${userId}`;
-  } else {
-    await sql`INSERT INTO permissions (user_id, settings) VALUES (${userId}, ${JSON.stringify(updated)})`;
-  }
-
-  await addActivityEntry(userId, {
+  addActivityEntry(userId, {
     type: "permission",
     action: "updated",
     service: "AgentVault",
@@ -163,368 +220,141 @@ export async function updateAgentPermissions(userId, permissions) {
     detail: `Agent permissions updated`,
   });
 
+  saveToDisk();
   return updated;
 }
 
-// --- Agent Firewall Policies (PostgreSQL) ---
+// --- Activity Log ---
 
-const DEFAULT_AGENT_POLICIES = {
-  github: { enabled: true, allowedActions: ["read_issues", "read_repos", "read_prs"] },
-  gmail: { enabled: true, allowedActions: ["read_email", "send_email"] },
-  "google-drive": { enabled: true, allowedActions: ["read_files"] },
-};
-
-export async function getAgentPolicies(userId) {
-  await ensureTables();
-  const sql = getSQL();
-  const rows = await sql`SELECT policies FROM agent_policies WHERE user_id = ${userId}`;
-  if (rows.length === 0) return { ...DEFAULT_AGENT_POLICIES };
-  return { ...DEFAULT_AGENT_POLICIES, ...rows[0].policies };
-}
-
-export async function updateAgentPolicies(userId, policies) {
-  await ensureTables();
-  const sql = getSQL();
-  const current = await getAgentPolicies(userId);
-  const updated = { ...current, ...policies };
-
-  const existing = await sql`SELECT user_id FROM agent_policies WHERE user_id = ${userId}`;
-  if (existing.length > 0) {
-    await sql`UPDATE agent_policies SET policies = ${JSON.stringify(updated)} WHERE user_id = ${userId}`;
-  } else {
-    await sql`INSERT INTO agent_policies (user_id, policies) VALUES (${userId}, ${JSON.stringify(updated)})`;
-  }
-
-  await addActivityEntry(userId, {
-    type: "firewall",
-    action: "policy_updated",
-    service: "AgentVault",
-    serviceId: "agentvault",
-    detail: "Agent firewall policies updated",
-  });
-
-  return updated;
-}
-
-// --- Rate Limiting ---
-
-export async function getRecentActionCount(userId) {
-  await ensureTables();
-  const sql = getSQL();
-  const oneHourAgo = new Date(Date.now() - 3600000).toISOString();
-  const rows = await sql`
-    SELECT COUNT(*) as count FROM activity_log
-    WHERE user_id = ${userId}
-    AND type = 'agent_action'
-    AND status = 'success'
-    AND timestamp > ${oneHourAgo}
-  `;
-  return Number(rows[0]?.count || 0);
-}
-
-// --- Activity Log (PostgreSQL) ---
-
-export async function addActivityEntry(userId, entry) {
-  await ensureTables();
-  const sql = getSQL();
-  const id = `log_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
-  const now = new Date().toISOString();
-  const status = entry.status || "success";
-
-  await sql`
-    INSERT INTO activity_log (id, user_id, timestamp, type, action, service, service_id, detail, status)
-    VALUES (${id}, ${userId}, ${now}, ${entry.type || null}, ${entry.action || null}, ${entry.service || null}, ${entry.serviceId || null}, ${entry.detail || null}, ${status})
-  `;
-
-  // Keep only last 500 entries per user
-  await sql`
-    DELETE FROM activity_log WHERE id IN (
-      SELECT id FROM activity_log WHERE user_id = ${userId}
-      ORDER BY timestamp DESC OFFSET 500
-    )
-  `;
-
-  return {
-    id,
+export function addActivityEntry(userId, entry) {
+  const logEntry = {
+    id: `log_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
     userId,
-    timestamp: now,
-    status,
+    timestamp: new Date().toISOString(),
+    status: entry.status || "success",
     ...entry,
   };
+  store.activityLog.unshift(logEntry);
+
+  // Keep only last 500 entries
+  if (store.activityLog.length > 500) {
+    store.activityLog = store.activityLog.slice(0, 500);
+  }
+
+  saveToDisk();
+  return logEntry;
 }
 
-export async function getActivityLog(userId, limit = 50) {
-  await ensureTables();
-  const sql = getSQL();
-  const rows = await sql`
-    SELECT id, user_id, timestamp, type, action, service, service_id, detail, status
-    FROM activity_log WHERE user_id = ${userId}
-    ORDER BY timestamp DESC LIMIT ${limit}
-  `;
-  return rows.map((r) => ({
-    id: r.id,
-    userId: r.user_id,
-    timestamp: r.timestamp,
-    type: r.type,
-    action: r.action,
-    service: r.service,
-    serviceId: r.service_id,
-    detail: r.detail,
-    status: r.status,
-  }));
+export function getActivityLog(userId, limit = 50) {
+  return store.activityLog
+    .filter((entry) => entry.userId === userId)
+    .slice(0, limit);
 }
 
-export async function getAllActivityLog(limit = 50) {
-  await ensureTables();
-  const sql = getSQL();
-  const rows = await sql`
-    SELECT id, user_id, timestamp, type, action, service, service_id, detail, status
-    FROM activity_log ORDER BY timestamp DESC LIMIT ${limit}
-  `;
-  return rows.map((r) => ({
-    id: r.id,
-    userId: r.user_id,
-    timestamp: r.timestamp,
-    type: r.type,
-    action: r.action,
-    service: r.service,
-    serviceId: r.service_id,
-    detail: r.detail,
-    status: r.status,
-  }));
+export function getAllActivityLog(limit = 50) {
+  return store.activityLog.slice(0, limit);
 }
 
-// --- Pending Requests (PostgreSQL) ---
+// --- Pending Requests ---
 
-export async function createPendingRequest(userId, request) {
-  await ensureTables();
-  const sql = getSQL();
+export function createPendingRequest(userId, request) {
   const id = `req_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
-  const now = new Date().toISOString();
+  const pending = {
+    id,
+    userId,
+    createdAt: new Date().toISOString(),
+    status: "pending",
+    ...request,
+  };
 
-  await sql`
-    INSERT INTO pending_requests (id, user_id, created_at, status, data)
-    VALUES (${id}, ${userId}, ${now}, 'pending', ${JSON.stringify(request)})
-  `;
+  const userRequests = store.pendingRequests.get(userId) || [];
+  userRequests.push(pending);
+  store.pendingRequests.set(userId, userRequests);
 
-  return { id, userId, createdAt: now, status: "pending", ...request };
+  saveToDisk();
+  return pending;
 }
 
-export async function getPendingRequests(userId) {
-  await ensureTables();
-  const sql = getSQL();
-  const rows = await sql`
-    SELECT id, user_id, created_at, status, data FROM pending_requests
-    WHERE user_id = ${userId} AND status = 'pending'
-  `;
-  return rows.map((r) => ({
-    id: r.id,
-    userId: r.user_id,
-    createdAt: r.created_at,
-    status: r.status,
-    ...r.data,
-  }));
+export function getPendingRequests(userId) {
+  return (store.pendingRequests.get(userId) || []).filter(
+    (r) => r.status === "pending"
+  );
 }
 
-export async function resolveRequest(userId, requestId, approved) {
-  await ensureTables();
-  const sql = getSQL();
-  const rows = await sql`
-    SELECT id, data FROM pending_requests WHERE id = ${requestId} AND user_id = ${userId}
-  `;
-  if (rows.length === 0) return null;
+export function resolveRequest(userId, requestId, approved) {
+  const userRequests = store.pendingRequests.get(userId) || [];
+  const request = userRequests.find((r) => r.id === requestId);
+  if (!request) return null;
 
-  const request = rows[0];
-  const newStatus = approved ? "approved" : "denied";
-  const now = new Date().toISOString();
+  request.status = approved ? "approved" : "denied";
+  request.resolvedAt = new Date().toISOString();
+  saveToDisk();
 
-  await sql`
-    UPDATE pending_requests SET status = ${newStatus}, resolved_at = ${now}
-    WHERE id = ${requestId}
-  `;
-
-  await addActivityEntry(userId, {
+  addActivityEntry(userId, {
     type: "agent_action",
     action: approved ? "approved" : "denied",
-    service: request.data.service,
-    serviceId: request.data.serviceId,
-    detail: `Agent request to ${request.data.actionDescription} was ${approved ? "approved" : "denied"}`,
+    service: request.service,
+    serviceId: request.serviceId,
+    detail: `Agent request to ${request.actionDescription} was ${approved ? "approved" : "denied"}`,
     status: approved ? "success" : "blocked",
   });
 
-  return { id: requestId, status: newStatus, resolvedAt: now, ...request.data };
+  return request;
 }
 
-// --- OAuth Token Storage (PostgreSQL) ---
+// --- OAuth Token Storage ---
 
-export async function storeOAuthToken(userId, serviceId, tokenData) {
-  await ensureTables();
-  const sql = getSQL();
-
-  const accessToken = tokenData.access_token;
-  const refreshToken = tokenData.refresh_token || null;
-  const tokenType = tokenData.token_type || "Bearer";
-  const expiresAt = tokenData.expires_in ? Date.now() + tokenData.expires_in * 1000 : null;
-  const scope = tokenData.scope || "";
-  const storedAt = Date.now();
-
-  const existing = await sql`
-    SELECT id FROM tokens WHERE user_id = ${userId} AND service_id = ${serviceId}
-  `;
-
-  if (existing.length > 0) {
-    await sql`
-      UPDATE tokens SET access_token = ${accessToken}, refresh_token = ${refreshToken},
-        token_type = ${tokenType}, expires_at = ${expiresAt}, scope = ${scope}, stored_at = ${storedAt}
-      WHERE user_id = ${userId} AND service_id = ${serviceId}
-    `;
-  } else {
-    await sql`
-      INSERT INTO tokens (user_id, service_id, access_token, refresh_token, token_type, expires_at, scope, stored_at)
-      VALUES (${userId}, ${serviceId}, ${accessToken}, ${refreshToken}, ${tokenType}, ${expiresAt}, ${scope}, ${storedAt})
-    `;
-  }
-}
-
-export async function getOAuthToken(userId, serviceId) {
-  await ensureTables();
-  const sql = getSQL();
-  const rows = await sql`
-    SELECT access_token, refresh_token, token_type, expires_at, scope, stored_at
-    FROM tokens WHERE user_id = ${userId} AND service_id = ${serviceId}
-  `;
-  if (rows.length === 0) return null;
-  const t = rows[0];
-  const expiresAt = t.expires_at ? Number(t.expires_at) : null;
-  const expired = expiresAt ? Date.now() > expiresAt - 60000 : false;
-  return {
-    accessToken: t.access_token,
-    refreshToken: t.refresh_token,
-    tokenType: t.token_type,
-    expiresAt,
-    scope: t.scope,
-    storedAt: Number(t.stored_at),
-    expired,
-  };
-}
-
-// Get sanitized token metadata (no secrets) for UI display
-export async function getTokenMetadata(userId, serviceId) {
-  await ensureTables();
-  const sql = getSQL();
-  const rows = await sql`
-    SELECT token_type, expires_at, scope, stored_at
-    FROM tokens WHERE user_id = ${userId} AND service_id = ${serviceId}
-  `;
-  if (rows.length === 0) return null;
-  const t = rows[0];
-  const expiresAt = t.expires_at ? Number(t.expires_at) : null;
-  return {
-    tokenType: t.token_type,
-    expiresAt,
-    expired: expiresAt ? Date.now() > expiresAt - 60000 : false,
-    scope: t.scope,
-    storedAt: Number(t.stored_at),
-    hasRefreshToken: false, // never expose this — just indicate presence
-  };
-}
-
-// Get token metadata for all connected services (no secrets)
-export async function getAllTokenMetadata(userId) {
-  await ensureTables();
-  const sql = getSQL();
-  const rows = await sql`
-    SELECT service_id, token_type, expires_at, scope, stored_at,
-      CASE WHEN refresh_token IS NOT NULL THEN true ELSE false END as has_refresh
-    FROM tokens WHERE user_id = ${userId}
-  `;
-  const result = {};
-  for (const t of rows) {
-    const expiresAt = t.expires_at ? Number(t.expires_at) : null;
-    result[t.service_id] = {
-      tokenType: t.token_type,
-      expiresAt,
-      expired: expiresAt ? Date.now() > expiresAt - 60000 : false,
-      scope: t.scope,
-      storedAt: Number(t.stored_at),
-      hasRefreshToken: !!t.has_refresh,
-    };
-  }
-  return result;
-}
-
-export async function refreshOAuthToken(userId, serviceId) {
-  const { getOAuthProvider } = await import("./oauth-config.js");
-  const token = await getOAuthToken(userId, serviceId);
-  if (!token || !token.refreshToken) return null;
-
-  const provider = getOAuthProvider(serviceId);
-  if (!provider || !provider.tokenUrl) return null;
-
-  const clientId = process.env[provider.clientIdEnv];
-  const clientSecret = process.env[provider.clientSecretEnv];
-  if (!clientId || !clientSecret) return null;
-
-  const body = new URLSearchParams({
-    grant_type: "refresh_token",
-    refresh_token: token.refreshToken,
-    client_id: clientId,
-    client_secret: clientSecret,
+export function storeOAuthToken(userId, serviceId, tokenData) {
+  const key = `${userId}:${serviceId}`;
+  store.tokens.set(key, {
+    accessToken: tokenData.access_token,
+    refreshToken: tokenData.refresh_token || null,
+    tokenType: tokenData.token_type || "Bearer",
+    expiresAt: tokenData.expires_in
+      ? Date.now() + tokenData.expires_in * 1000
+      : null,
+    scope: tokenData.scope || "",
+    storedAt: Date.now(),
   });
-
-  const res = await fetch(provider.tokenUrl, {
-    method: "POST",
-    headers: { "Content-Type": "application/x-www-form-urlencoded" },
-    body: body.toString(),
-  });
-
-  if (!res.ok) return null;
-
-  const data = await res.json();
-  // Google may not return refresh_token on refresh — preserve the existing one
-  if (!data.refresh_token) {
-    data.refresh_token = token.refreshToken;
-  }
-  if (!data.scope) {
-    data.scope = token.scope;
-  }
-
-  await storeOAuthToken(userId, serviceId, data);
-
-  const expiresIn = data.expires_in || 3600;
-  return {
-    accessToken: data.access_token,
-    refreshToken: data.refresh_token,
-    tokenType: data.token_type || "Bearer",
-    expiresAt: Date.now() + expiresIn * 1000,
-    scope: data.scope,
-    expired: false,
-  };
+  saveToDisk();
 }
 
-export async function deleteOAuthToken(userId, serviceId) {
-  await ensureTables();
-  const sql = getSQL();
-  await sql`DELETE FROM tokens WHERE user_id = ${userId} AND service_id = ${serviceId}`;
+export function getOAuthToken(userId, serviceId) {
+  const key = `${userId}:${serviceId}`;
+  const token = store.tokens.get(key);
+  if (!token) return null;
+  // Check expiry (with 60s buffer)
+  if (token.expiresAt && Date.now() > token.expiresAt - 60000) {
+    return { ...token, expired: true };
+  }
+  return { ...token, expired: false };
 }
 
-// --- OAuth State (in-memory, short-lived CSRF tokens) ---
+export function deleteOAuthToken(userId, serviceId) {
+  const key = `${userId}:${serviceId}`;
+  store.tokens.delete(key);
+  saveToDisk();
+}
+
+// --- OAuth State (CSRF protection) ---
 
 export function storeOAuthState(state, data) {
-  oauthStates.set(state, { ...data, createdAt: Date.now() });
+  // Auto-expire states after 10 minutes
+  store.oauthStates.set(state, { ...data, createdAt: Date.now() });
   // Cleanup old states
   const tenMinutes = 10 * 60 * 1000;
-  for (const [key, val] of oauthStates) {
+  for (const [key, val] of store.oauthStates) {
     if (Date.now() - val.createdAt > tenMinutes) {
-      oauthStates.delete(key);
+      store.oauthStates.delete(key);
     }
   }
 }
 
 export function consumeOAuthState(state) {
-  const data = oauthStates.get(state);
+  const data = store.oauthStates.get(state);
   if (!data) return null;
-  oauthStates.delete(state);
+  store.oauthStates.delete(state);
+  // Reject if older than 10 minutes
   if (Date.now() - data.createdAt > 10 * 60 * 1000) return null;
   return data;
 }
