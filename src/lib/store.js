@@ -5,6 +5,7 @@
 
 import fs from "fs";
 import path from "path";
+import { getOAuthProvider } from "./oauth-config";
 
 const DATA_DIR = path.join(process.cwd(), ".data");
 const DATA_FILE = path.join(DATA_DIR, "store.json");
@@ -20,6 +21,7 @@ function loadFromDisk() {
         connections: new Map(Object.entries(data.connections || {})),
         tokens: new Map(Object.entries(data.tokens || {})),
         permissions: new Map(Object.entries(data.permissions || {})),
+        policies: new Map(Object.entries(data.policies || {})),
         activityLog: data.activityLog || [],
         pendingRequests: new Map(Object.entries(data.pendingRequests || {})),
       };
@@ -39,6 +41,7 @@ function saveToDisk() {
       connections: Object.fromEntries(store.connections),
       tokens: Object.fromEntries(store.tokens),
       permissions: Object.fromEntries(store.permissions),
+      policies: Object.fromEntries(store.policies),
       activityLog: store.activityLog,
       pendingRequests: Object.fromEntries(store.pendingRequests),
     };
@@ -61,6 +64,7 @@ function initStore() {
     connections: new Map(),
     tokens: new Map(),
     permissions: new Map(),
+    policies: new Map(),
     activityLog: [],
     pendingRequests: new Map(),
   };
@@ -224,6 +228,56 @@ export function updateAgentPermissions(userId, permissions) {
   return updated;
 }
 
+// --- Firewall Policies ---
+
+const DEFAULT_AGENT_POLICIES = {
+  github: {
+    enabled: false,
+    allowedActions: [],
+  },
+  gmail: {
+    enabled: false,
+    allowedActions: [],
+  },
+  "google-drive": {
+    enabled: false,
+    allowedActions: [],
+  },
+};
+
+export function getAgentPolicies(userId) {
+  const stored = store.policies.get(userId);
+  return {
+    ...DEFAULT_AGENT_POLICIES,
+    ...(stored || {}),
+  };
+}
+
+export function updateAgentPolicies(userId, policyPatch) {
+  const current = getAgentPolicies(userId);
+  const merged = { ...current };
+
+  for (const [serviceId, patch] of Object.entries(policyPatch || {})) {
+    merged[serviceId] = {
+      ...(merged[serviceId] || { enabled: false, allowedActions: [] }),
+      ...(patch || {}),
+    };
+  }
+
+  store.policies.set(userId, merged);
+
+  addActivityEntry(userId, {
+    type: "permission",
+    action: "firewall_policy_updated",
+    service: "AgentVault",
+    serviceId: "agentvault",
+    detail: "Firewall policies updated",
+  });
+
+  saveToDisk();
+  return merged;
+}
+
 // --- Activity Log ---
 
 export function addActivityEntry(userId, entry) {
@@ -253,6 +307,15 @@ export function getActivityLog(userId, limit = 50) {
 
 export function getAllActivityLog(limit = 50) {
   return store.activityLog.slice(0, limit);
+}
+
+export function getRecentActionCount(userId) {
+  const oneHourAgo = Date.now() - 60 * 60 * 1000;
+  return store.activityLog.filter((entry) => {
+    if (entry.userId !== userId) return false;
+    const ts = Date.parse(entry.timestamp);
+    return Number.isFinite(ts) && ts >= oneHourAgo;
+  }).length;
 }
 
 // --- Pending Requests ---
@@ -334,6 +397,94 @@ export function deleteOAuthToken(userId, serviceId) {
   const key = `${userId}:${serviceId}`;
   store.tokens.delete(key);
   saveToDisk();
+}
+
+export function getAllTokenMetadata(userId) {
+  const connections = getUserConnections(userId);
+  const metadata = {};
+
+  for (const connection of connections) {
+    const token = getOAuthToken(userId, connection.serviceId);
+    if (!token) continue;
+
+    metadata[connection.serviceId] = {
+      tokenType: token.tokenType,
+      hasRefreshToken: !!token.refreshToken,
+      expiresAt: token.expiresAt,
+      expired: !!token.expired,
+      storedAt: token.storedAt,
+      scope: token.scope,
+    };
+  }
+
+  return metadata;
+}
+
+export async function refreshOAuthToken(userId, serviceId) {
+  const current = getOAuthToken(userId, serviceId);
+  if (!current?.refreshToken) {
+    return null;
+  }
+
+  const provider = getOAuthProvider(serviceId);
+  if (!provider) {
+    return null;
+  }
+
+  const clientId = process.env[provider.clientIdEnv];
+  const clientSecret = process.env[provider.clientSecretEnv];
+  if (!clientId || !clientSecret) {
+    return null;
+  }
+
+  try {
+    const params = new URLSearchParams({
+      grant_type: "refresh_token",
+      client_id: clientId,
+      client_secret: clientSecret,
+      refresh_token: current.refreshToken,
+    });
+
+    const res = await fetch(provider.tokenUrl, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/x-www-form-urlencoded",
+        Accept: "application/json",
+      },
+      body: params.toString(),
+    });
+
+    if (!res.ok) {
+      const errText = await res.text();
+      console.error(`Refresh token exchange failed for ${serviceId}:`, errText);
+      return null;
+    }
+
+    const refreshed = await res.json();
+    if (refreshed.error) {
+      console.error(`Refresh token error for ${serviceId}:`, refreshed.error_description || refreshed.error);
+      return null;
+    }
+
+    storeOAuthToken(userId, serviceId, {
+      ...refreshed,
+      refresh_token: refreshed.refresh_token || current.refreshToken,
+    });
+
+    addActivityEntry(userId, {
+      type: "token_vault",
+      action: "oauth_token_refreshed",
+      service: serviceId,
+      serviceId,
+      detail: `OAuth access token refreshed for ${serviceId}`,
+      status: "success",
+    });
+
+    return getOAuthToken(userId, serviceId);
+  } catch (err) {
+    console.error(`Refresh OAuth token failed for ${serviceId}:`, err);
+    return null;
+  }
 }
 
 // --- OAuth State (CSRF protection) ---
