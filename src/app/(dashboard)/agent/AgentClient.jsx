@@ -15,6 +15,8 @@ export default function AgentClient() {
   const [stepUpModal, setStepUpModal] = useState(null);
   const [mfaCode, setMfaCode] = useState("");
   const [mfaError, setMfaError] = useState("");
+  const [scopeUpgradeModal, setScopeUpgradeModal] = useState(null);
+  const [scopeUpgradeLoading, setScopeUpgradeLoading] = useState(false);
   const messagesEndRef = useRef(null);
 
   useEffect(() => {
@@ -43,6 +45,20 @@ export default function AgentClient() {
             riskLevel: stepUpStep.riskLevel,
           });
         }
+
+        // Check for scope upgrade required
+        const scopeUpgradeStep = data.steps.find((s) => s.type === "scope_upgrade_required");
+        if (scopeUpgradeStep) {
+          setScopeUpgradeModal({
+            message: userMessage,
+            service: scopeUpgradeStep.service,
+            serviceId: scopeUpgradeStep.serviceId,
+            missingScopes: scopeUpgradeStep.missingScopes,
+            currentScopes: scopeUpgradeStep.currentScopes,
+            allRequiredScopes: scopeUpgradeStep.allRequiredScopes,
+          });
+        }
+
         setMessages((prev) => [
           ...prev,
           { role: "agent", steps: data.steps },
@@ -89,6 +105,34 @@ export default function AgentClient() {
       { role: "user", content: "✅ MFA verified — re-executing with step-up authentication" },
     ]);
     await executeCommand(message, { stepUpConfirmed: true });
+  };
+
+  const handleScopeUpgrade = async () => {
+    if (!scopeUpgradeModal) return;
+    setScopeUpgradeLoading(true);
+    try {
+      const res = await fetch("/api/connections/reconnect", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          serviceId: scopeUpgradeModal.serviceId,
+          requiredScopes: scopeUpgradeModal.allRequiredScopes,
+        }),
+      });
+
+      const data = await res.json();
+      if (data.authUrl) {
+        // Redirect to OAuth authorization URL
+        window.location.href = data.authUrl;
+      } else {
+        alert("Failed to start OAuth flow: " + (data.error || "Unknown error"));
+      }
+    } catch (err) {
+      console.error("Scope upgrade error:", err);
+      alert("Failed to upgrade scopes. Please try again.");
+    } finally {
+      setScopeUpgradeLoading(false);
+    }
   };
 
   const suggestions = [
@@ -296,6 +340,120 @@ export default function AgentClient() {
           </div>
         </div>
       )}
+
+      {/* Scope Upgrade Modal */}
+      {scopeUpgradeModal && (
+        <div
+          className="modal-overlay"
+          style={{
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+          }}
+          onClick={() => { setScopeUpgradeModal(null); }}
+        >
+          <div
+            className="card"
+            style={{
+              maxWidth: 440,
+              width: "90%",
+              padding: "2rem",
+            }}
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div style={{ fontSize: "2.5rem", marginBottom: "0.5rem" }}>🔐</div>
+            <h2 style={{ margin: "0 0 0.25rem", fontSize: "1.2rem", fontWeight: 700 }}>
+              Additional Permissions Required
+            </h2>
+            <p style={{ color: "var(--text-muted)", fontSize: "0.75rem", margin: "0 0 0.75rem" }}>
+              To complete this action, we need additional permissions from {scopeUpgradeModal.service}
+            </p>
+
+            <div
+              style={{
+                background: "rgba(59, 130, 246, 0.1)",
+                border: "1px solid rgba(59, 130, 246, 0.3)",
+                borderRadius: "var(--radius-sm)",
+                padding: "0.75rem",
+                marginBottom: "1rem",
+                fontSize: "0.8rem",
+                textAlign: "left",
+              }}
+            >
+              <div style={{ marginBottom: "0.5rem" }}>
+                <strong style={{ color: "var(--text-primary)" }}>📋 Scope Summary:</strong>
+              </div>
+              <div style={{ marginBottom: "0.5rem" }}>
+                <strong>Currently have:</strong>
+                <div style={{ display: "flex", flexWrap: "wrap", gap: "0.35rem", marginTop: "0.25rem" }}>
+                  {scopeUpgradeModal.currentScopes && scopeUpgradeModal.currentScopes.length > 0 ? (
+                    scopeUpgradeModal.currentScopes.map((s) => (
+                      <span
+                        key={s}
+                        style={{
+                          background: "rgba(34, 197, 94, 0.2)",
+                          color: "#4ade80",
+                          padding: "2px 6px",
+                          borderRadius: "3px",
+                          fontSize: "0.7rem",
+                        }}
+                      >
+                        {s}
+                      </span>
+                    ))
+                  ) : (
+                    <span style={{ color: "var(--text-muted)", fontSize: "0.7rem" }}>None</span>
+                  )}
+                </div>
+              </div>
+              <div>
+                <strong>Need to add:</strong>
+                <div style={{ display: "flex", flexWrap: "wrap", gap: "0.35rem", marginTop: "0.25rem" }}>
+                  {scopeUpgradeModal.missingScopes && scopeUpgradeModal.missingScopes.length > 0 ? (
+                    scopeUpgradeModal.missingScopes.map((s) => (
+                      <span
+                        key={s}
+                        style={{
+                          background: "rgba(239, 68, 68, 0.2)",
+                          color: "#f87171",
+                          padding: "2px 6px",
+                          borderRadius: "3px",
+                          fontSize: "0.7rem",
+                        }}
+                      >
+                        {s}
+                      </span>
+                    ))
+                  ) : (
+                    <span style={{ color: "var(--text-muted)", fontSize: "0.7rem" }}>None</span>
+                  )}
+                </div>
+              </div>
+            </div>
+
+            <p style={{ color: "var(--text-muted)", fontSize: "0.75rem", margin: "0.75rem 0", textAlign: "left" }}>
+              Click "Authorize" to grant these permissions through {scopeUpgradeModal.service}. You'll be redirected to authorize and return here to complete your request.
+            </p>
+
+            <div style={{ display: "flex", gap: "0.75rem", justifyContent: "flex-end" }}>
+              <button
+                className="btn btn-ghost"
+                onClick={() => { setScopeUpgradeModal(null); }}
+                disabled={scopeUpgradeLoading}
+              >
+                Cancel
+              </button>
+              <button
+                className="btn btn-primary"
+                onClick={handleScopeUpgrade}
+                disabled={scopeUpgradeLoading}
+              >
+                {scopeUpgradeLoading ? "Redirecting…" : `🔗 Authorize ${scopeUpgradeModal.service}`}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
@@ -304,6 +462,7 @@ function AgentStep({ step }) {
   const iconMap = {
     firewall_check: "🛡️",
     firewall_blocked: "🚫",
+    scope_upgrade_required: "🔐",
     step_up_required: "⚠️",
     auth_check: "🔑",
     authorized: "✅",

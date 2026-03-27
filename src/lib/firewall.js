@@ -119,6 +119,9 @@ export async function firewallCheck(userId, intent, options = {}) {
       allowed: false,
       reason: tokenResult.reason,
       message: tokenResult.message,
+      missingScopes: tokenResult.missingScopes,
+      currentScopes: tokenResult.currentScopes,
+      allRequiredScopes: tokenResult.allRequiredScopes,
     };
   }
 

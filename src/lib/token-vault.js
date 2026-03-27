@@ -54,6 +54,8 @@ export async function requestScopedToken(userId, serviceId, requiredScopes) {
       success: false,
       reason: "insufficient_scopes",
       missingScopes,
+      currentScopes: vaultCheck.scopes,
+      allRequiredScopes: requiredScopes,
       message: `Missing required scopes: ${missingScopes.join(", ")}`,
     };
   }

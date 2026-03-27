@@ -353,6 +353,18 @@ export async function executeAgentCommand(userId, message, options = {}) {
           actionDescription: firewallResult.actionDescription,
           riskLevel: firewallResult.riskLevel,
         });
+      } else if (firewallResult.reason === "insufficient_scopes") {
+        steps.push({
+          type: "scope_upgrade_required",
+          service: intent.service,
+          serviceId: intent.serviceId,
+          title: `🔐 Additional Permissions Required — ${intent.service}`,
+          content: `To "${intent.description}", we need additional permissions. You currently have: ${firewallResult.currentScopes?.join(", ") || "none"}. We need: ${firewallResult.allRequiredScopes?.join(", ") || "unknown"}`,
+          icon: "scope_denied",
+          missingScopes: firewallResult.missingScopes,
+          currentScopes: firewallResult.currentScopes,
+          allRequiredScopes: firewallResult.allRequiredScopes,
+        });
       } else {
         steps.push({
           type: "firewall_blocked",
